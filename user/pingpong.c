@@ -37,6 +37,8 @@ int main() {
         printf("%d: received pong\n", getpid());
         close(parent[1]);
         close(child[0]);
+        // 确保父进程在子进程退出后再退出
+        wait(0);
         exit(0);
     }
 }
