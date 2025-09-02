@@ -1,0 +1,14 @@
+1. which function called syscall? 
+    kernel/trap.c中的usertrap()这个函数
+
+2. What is the value of p->trapframe->a7 and what does that value represent?
+    3;执行的系统调用类型(wait)
+
+3. What was the previous mode that the CPU was in? 
+    系统调用前为用户模式
+
+4. Write down the assembly instruction the kernel is panicing at. Which register corresponds to the variable num? 
+    通过sepc找到对应的panic行，发现num对应了a3这个寄存器
+
+5. Why does the kernel crash?
+    访问了未映射的地址0
