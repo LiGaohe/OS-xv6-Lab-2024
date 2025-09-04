@@ -102,6 +102,10 @@ walk(pagetable_t pagetable, uint64 va, int alloc)
     pte_t *pte = &pagetable[PX(level, va)];
     if(*pte & PTE_V) {
       pagetable = (pagetable_t)PTE2PA(*pte);
+      // 如果遇到超级页页表项，直接返回
+      if (*pte & PTE_PS) {
+        return pte;
+      }
 #ifdef LAB_PGTBL
       if(PTE_LEAF(*pte)) {
         return pte;
@@ -116,6 +120,26 @@ walk(pagetable_t pagetable, uint64 va, int alloc)
   }
   return &pagetable[PX(0, va)];
 }
+
+pte_t *
+walkSuper(pagetable_t pagetable, uint64 va, int alloc)
+{
+  if(va >= MAXVA)
+    panic("walk");
+
+  pte_t *pte = &pagetable[PX(2, va)];
+  // 如果PTE_V为1，说明该二级页表存在
+  if (*pte & PTE_V) {
+    pagetable = (pagetable_t)PTE2PA(*pte); // 取出二级页表地址
+  } else {
+    if (!alloc || (pagetable = (pde_t *)kalloc()) == 0)
+      return 0;
+    memset(pagetable, 0, PGSIZE);
+    *pte = PA2PTE(pagetable) | PTE_V;
+  }
+  return &pagetable[PX(1, va)];
+}  
+
 
 // Look up a virtual address, return the physical address,
 // or 0 if not mapped.
@@ -187,6 +211,37 @@ mappages(pagetable_t pagetable, uint64 va, uint64 size, uint64 pa, int perm)
   return 0;
 }
 
+int
+mapSuperPages(pagetable_t pagetable, uint64 va, uint64 size, uint64 pa, int perm)
+{
+  uint64 a, last;
+  pte_t *pte;
+
+  if((va % SUPERPGSIZE) != 0)
+    panic("mapSuperPages: va not aligned");
+
+  if((size % SUPERPGSIZE) != 0)
+    panic("mapSuperPages: size not aligned");
+
+  if(size == 0)
+    panic("mapSuperPages: size");
+  
+  a = va;
+  last = va + size - SUPERPGSIZE;
+  for(;;){
+    if((pte = walkSuper(pagetable, a, 1)) == 0)
+      return -1;
+    if(*pte & PTE_V)
+      panic("mapSuperPages: remap");
+    *pte = PA2PTE(pa) | perm | PTE_V | PTE_PS;
+    if(a == last)
+      break;
+    a += SUPERPGSIZE;
+    pa += SUPERPGSIZE;
+  }
+  return 0;
+}
+
 // Remove npages of mappings starting from va. va must be
 // page-aligned. The mappings must exist.
 // Optionally free the physical memory.
@@ -195,25 +250,45 @@ uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
 {
   uint64 a;
   pte_t *pte;
-  int sz;
+  uint64 sz;
 
   if((va % PGSIZE) != 0)
     panic("uvmunmap: not aligned");
 
   for(a = va; a < va + npages*PGSIZE; a += sz){
-    sz = PGSIZE;
+    sz = PGSIZE; // 默认为普通页大小
+    
     if((pte = walk(pagetable, a, 0)) == 0)
       panic("uvmunmap: walk");
+      
     if((*pte & PTE_V) == 0) {
-      printf("va=%ld pte=%ld\n", a, *pte);
+      printf("va=%lx pte=%lx\n", a, *pte);
       panic("uvmunmap: not mapped");
     }
+    
     if(PTE_FLAGS(*pte) == PTE_V)
       panic("uvmunmap: not a leaf");
-    if(do_free){
-      uint64 pa = PTE2PA(*pte);
-      kfree((void*)pa);
+      
+    // 检查是否是超级页
+    if(*pte & PTE_PS) {
+      sz = SUPERPGSIZE;
     }
+    
+    if(do_free){
+
+      // 如果是超级页
+      if (*pte & PTE_PS) {
+        uint64 pa = PTE2PA(*pte);
+        superKfree((void*)pa);
+      } else
+
+      {
+        // 普通页
+        uint64 pa = PTE2PA(*pte);
+        kfree((void*)pa);
+      }
+    }
+    
     *pte = 0;
   }
 }
@@ -262,8 +337,25 @@ uvmalloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz, int xperm)
 
   oldsz = PGROUNDUP(oldsz);
   for(a = oldsz; a < newsz; a += sz){
-    sz = PGSIZE;
-    mem = kalloc();
+    // 检查能否分配超级页
+    if (a % SUPERPGSIZE == 0 && a + SUPERPGSIZE <= newsz) {
+      sz = SUPERPGSIZE;
+      mem = superKalloc();
+      printf("superKalloc %p\n", mem);
+      // 如果超级页分配失败，回退到普通页分配
+      if (mem == 0) {
+        sz = PGSIZE;
+        mem = kalloc();
+      }
+    } else {
+      sz = PGSIZE;
+      mem = kalloc();
+    }
+
+    if (sz == SUPERPGSIZE) {
+      printf("uvmalloc: 0x%lx\n", a);
+    }
+
     if(mem == 0){
       uvmdealloc(pagetable, a, oldsz);
       return 0;
@@ -271,11 +363,19 @@ uvmalloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz, int xperm)
 #ifndef LAB_SYSCALL
     memset(mem, 0, sz);
 #endif
-    if(mappages(pagetable, a, sz, (uint64)mem, PTE_R|PTE_U|xperm) != 0){
-      kfree(mem);
-      uvmdealloc(pagetable, a, oldsz);
-      return 0;
-    }
+    if (sz == PGSIZE) {
+      if(mappages(pagetable, a, sz, (uint64)mem, PTE_R|PTE_U|xperm) != 0){
+        kfree(mem);
+        uvmdealloc(pagetable, a, oldsz);
+        return 0;
+      }
+  } else if (sz == SUPERPGSIZE) {
+      if (mapSuperPages(pagetable, a, sz, (uint64)mem, PTE_R|PTE_U|xperm) != 0) {
+        superKfree(mem);
+        uvmdealloc(pagetable, a, oldsz);
+        return 0;
+      }
+  }
   }
   return newsz;
 }
@@ -352,14 +452,26 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
       panic("uvmcopy: page not present");
     pa = PTE2PA(*pte);
     flags = PTE_FLAGS(*pte);
-    if((mem = kalloc()) == 0)
+    // 如果为普通页
+    if ((*pte & PTE_PS) == 0) {
+      if((mem = kalloc()) == 0)
       goto err;
-    memmove(mem, (char*)pa, PGSIZE);
-    if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
+      memmove(mem, (char*)pa, PGSIZE);
+      if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
       kfree(mem);
+      goto err;
+      }
+    } else { // 如果为超级页
+      szinc = SUPERPGSIZE;
+      if((mem = superKalloc()) == 0)
+      goto err;
+      memmove(mem, (char*)pa, SUPERPGSIZE);
+      if(mapSuperPages(new, i, SUPERPGSIZE, (uint64)mem, flags) != 0){
+      superKfree(mem);
       goto err;
     }
   }
+}
   return 0;
 
  err:
@@ -492,7 +604,6 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
 void 
 vmprint_re(pagetable_t pagetable, int level, uint64 va) {
   uint64 sz;
-  // 为什么va使用uint64？因为要打印前缀，而前缀可能超过32位
   // 错误处理
   if(pagetable == 0) {
     printf("vmprint_re: null pagetable\n");
@@ -522,26 +633,22 @@ vmprint_re(pagetable_t pagetable, int level, uint64 va) {
       printf(" ..");
     }
     uint64 curr_va = va + i * sz; // 计算当前PTE对应的虚拟地址
-    // 为什么当前PTE对应的虚拟地址是va + i * sz？
+        // 为什么当前PTE对应的虚拟地址是va + i * sz？
     // 因为va是当前页表的起始虚拟地址，i是PTE索引，sz是当前页表的映射范围
     // 打印当前页表项信息
     printf("0x%lx: pte 0x%lx pa 0x%lx\n", 
       curr_va, pte, PTE2PA(pte));
     // 递归处理下一级页表
-    // 不是叶子节点才递归
     if ((pte & (PTE_R | PTE_W | PTE_X)) == 0) {
       vmprint_re((pagetable_t)PTE2PA(pte), level - 1, curr_va);
     }
   }
 }
 
-
 void
 vmprint(pagetable_t pagetable) {
   printf("page table %p\n", pagetable);
-  vmprint_re(pagetable, 2, 0); 
-  // 为什么传2？因为RISC-V Sv39使用3级页表，顶级页表是第2级（从0开始计数）
-  // 为什么传0？因为初始时没有前缀
+  vmprint_re(pagetable, 2, 0);
 }
 #endif
 

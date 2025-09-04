@@ -23,10 +23,17 @@ struct {
   struct run *freelist;
 } kmem;
 
+// 空闲超级页链
+struct {
+  struct spinlock lock;
+  struct run *freelist;
+} superKmem;
+
 void
 kinit()
 {
   initlock(&kmem.lock, "kmem");
+  initlock(&superKmem.lock, "superKmem");
   freerange(end, (void*)PHYSTOP);
 }
 
@@ -34,9 +41,16 @@ void
 freerange(void *pa_start, void *pa_end)
 {
   char *p;
+  // 减少预留给超级页的内存，从16个减少到8个超级页
   p = (char*)PGROUNDUP((uint64)pa_start);
-  for(; p + PGSIZE <= (char*)pa_end; p += PGSIZE)
+  for(; p + PGSIZE <= (char*)pa_end - 8 * SUPERPGSIZE; p += PGSIZE) {
     kfree(p);
+  }
+
+    p = (char*)SUPERPGROUNDUP((uint64)p);
+  for(; p + SUPERPGSIZE <= (char*)pa_end; p += SUPERPGSIZE) {
+    superKfree(p);
+  }
 }
 
 // Free the page of physical memory pointed at by pa,
@@ -62,6 +76,28 @@ kfree(void *pa)
   release(&kmem.lock);
 }
 
+void
+superKfree(void *pa)
+{
+  struct run *r;
+
+  // 如果地址不对齐，或者地址不在允许范围内，就panic
+  if(((uint64)pa % SUPERPGSIZE) != 0 || (char*)pa < end || (uint64)pa >= PHYSTOP) {
+    panic("superKfree");
+  }
+
+  // 用垃圾填充内存，以便捕捉悬空引用
+  memset(pa, 1, SUPERPGSIZE);
+
+  r = (struct run*)pa;
+
+  acquire(&superKmem.lock);
+  r->next = superKmem.freelist;
+  superKmem.freelist = r;
+  release(&superKmem.lock);
+}
+
+
 // Allocate one 4096-byte page of physical memory.
 // Returns a pointer that the kernel can use.
 // Returns 0 if the memory cannot be allocated.
@@ -78,5 +114,22 @@ kalloc(void)
 
   if(r)
     memset((char*)r, 5, PGSIZE); // fill with junk
+  return (void*)r;
+}
+
+// 分配一个超级页（2MB）
+void *
+superKalloc(void)
+{
+  struct run *r;
+
+  acquire(&superKmem.lock);
+  r = superKmem.freelist;
+  if(r)
+    superKmem.freelist = r->next;
+  release(&superKmem.lock);
+
+  if(r)
+    memset((char*)r, 5, SUPERPGSIZE); // fill with junk
   return (void*)r;
 }
