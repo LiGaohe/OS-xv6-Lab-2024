@@ -76,6 +76,18 @@ usertrap(void)
   if(killed(p))
     exit(-1);
 
+// 若设备号为2，则为时间中断，alarm
+if(which_dev == 2 && p->alarm_interval > 0){  
+	      if(--p->alarm_ticks_left == 0 && !p->alarm_running){  
+	        // 备份用户寄存器  
+	        memmove(p->alarm_trapframe, p->trapframe, sizeof(struct trapframe));  
+	        p->alarm_running = 1;  // 标记正在运行handler，防重入
+	        // 修改返回地址为用户 handler
+	        p->trapframe->epc = (uint64)p->alarm_handler;  
+	        // 重置计数器 
+	        p->alarm_ticks_left = p->alarm_interval;  
+	      }  
+	    }
   // give up the CPU if this is a timer interrupt.
   if(which_dev == 2)
     yield();
