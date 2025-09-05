@@ -4,9 +4,9 @@
 #include "elf.h"
 #include "riscv.h"
 #include "defs.h"
-#include "fs.h"
 #include "spinlock.h"
 #include "proc.h"
+#include "fs.h"
 
 /*
  * the kernel's page table.
@@ -31,6 +31,14 @@ kvmmake(void)
 
   // virtio mmio disk interface
   kvmmap(kpgtbl, VIRTIO0, VIRTIO0, PGSIZE, PTE_R | PTE_W);
+
+#ifdef LAB_NET
+  // PCI-E ECAM (configuration space), for pci.c
+  kvmmap(kpgtbl, 0x30000000L, 0x30000000L, 0x10000000, PTE_R | PTE_W);
+
+  // pci.c maps the e1000's registers here.
+  kvmmap(kpgtbl, 0x40000000L, 0x40000000L, 0x20000, PTE_R | PTE_W);
+#endif  
 
   // PLIC
   kvmmap(kpgtbl, PLIC, PLIC, 0x4000000, PTE_R | PTE_W);
@@ -94,8 +102,13 @@ walk(pagetable_t pagetable, uint64 va, int alloc)
     pte_t *pte = &pagetable[PX(level, va)];
     if(*pte & PTE_V) {
       pagetable = (pagetable_t)PTE2PA(*pte);
+#ifdef LAB_PGTBL
+      if(PTE_LEAF(*pte)) {
+        return pte;
+      }
+#endif
     } else {
-      if(!alloc || (pagetable = (pagetable_t)kalloc()) == 0)
+      if(!alloc || (pagetable = (pde_t*)kalloc()) == 0)
         return 0;
       memset(pagetable, 0, PGSIZE);
       *pte = PA2PTE(pagetable) | PTE_V;
@@ -126,6 +139,7 @@ walkaddr(pagetable_t pagetable, uint64 va)
   pa = PTE2PA(*pte);
   return pa;
 }
+
 
 // add a mapping to the kernel page table.
 // only used when booting.
@@ -181,15 +195,19 @@ uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
 {
   uint64 a;
   pte_t *pte;
+  int sz;
 
   if((va % PGSIZE) != 0)
     panic("uvmunmap: not aligned");
 
-  for(a = va; a < va + npages*PGSIZE; a += PGSIZE){
+  for(a = va; a < va + npages*PGSIZE; a += sz){
+    sz = PGSIZE;
     if((pte = walk(pagetable, a, 0)) == 0)
       panic("uvmunmap: walk");
-    if((*pte & PTE_V) == 0)
+    if((*pte & PTE_V) == 0) {
+      printf("va=%ld pte=%ld\n", a, *pte);
       panic("uvmunmap: not mapped");
+    }
     if(PTE_FLAGS(*pte) == PTE_V)
       panic("uvmunmap: not a leaf");
     if(do_free){
@@ -229,6 +247,7 @@ uvmfirst(pagetable_t pagetable, uchar *src, uint sz)
   memmove(mem, src, sz);
 }
 
+
 // Allocate PTEs and physical memory to grow process from oldsz to
 // newsz, which need not be page aligned.  Returns new size or 0 on error.
 uint64
@@ -236,19 +255,23 @@ uvmalloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz, int xperm)
 {
   char *mem;
   uint64 a;
+  int sz;
 
   if(newsz < oldsz)
     return oldsz;
 
   oldsz = PGROUNDUP(oldsz);
-  for(a = oldsz; a < newsz; a += PGSIZE){
+  for(a = oldsz; a < newsz; a += sz){
+    sz = PGSIZE;
     mem = kalloc();
     if(mem == 0){
       uvmdealloc(pagetable, a, oldsz);
       return 0;
     }
-    memset(mem, 0, PGSIZE);
-    if(mappages(pagetable, a, PGSIZE, (uint64)mem, PTE_R|PTE_U|xperm) != 0){
+#ifndef LAB_SYSCALL
+    memset(mem, 0, sz);
+#endif
+    if(mappages(pagetable, a, sz, (uint64)mem, PTE_R|PTE_U|xperm) != 0){
       kfree(mem);
       uvmdealloc(pagetable, a, oldsz);
       return 0;
@@ -307,8 +330,8 @@ uvmfree(pagetable_t pagetable, uint64 sz)
 
 // Given a parent process's page table, copy
 // its memory into a child's page table.
-// Uses copy-on-write: instead of copying pages,
-// map them read-only and shared, with COW flag.
+// Copies both the page table and the
+// physical memory.
 // returns 0 on success, -1 on failure.
 // frees any allocated pages on failure.
 int
@@ -317,27 +340,25 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
   pte_t *pte;
   uint64 pa, i;
   uint flags;
+  char *mem;
+  int szinc;
 
-  for(i = 0; i < sz; i += PGSIZE){
+  for(i = 0; i < sz; i += szinc){
+    szinc = PGSIZE;
+    szinc = PGSIZE;
     if((pte = walk(old, i, 0)) == 0)
       panic("uvmcopy: pte should exist");
     if((*pte & PTE_V) == 0)
       panic("uvmcopy: page not present");
-    
     pa = PTE2PA(*pte);
     flags = PTE_FLAGS(*pte);
-
-    // If the page was writable, make it COW and remove write permission
-    if(flags & PTE_W) {
-      flags = (flags & ~PTE_W) | PTE_COW;
-      *pte = PA2PTE(pa) | flags;
-    }
-
-    // Map the same physical page in child, increment reference count
-    if(mappages(new, i, PGSIZE, pa, flags) != 0){
+    if((mem = kalloc()) == 0)
+      goto err;
+    memmove(mem, (char*)pa, PGSIZE);
+    if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
+      kfree(mem);
       goto err;
     }
-    krefpage((void*)pa);
   }
   return 0;
 
@@ -370,26 +391,21 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
 
   while(len > 0){
     va0 = PGROUNDDOWN(dstva);
-    if(va0 >= MAXVA)
+    if (va0 >= MAXVA)
       return -1;
-    pte = walk(pagetable, va0, 0);
-    if(pte == 0 || (*pte & PTE_V) == 0 || (*pte & PTE_U) == 0)
+    if((pte = walk(pagetable, va0, 0)) == 0) {
+      // printf("copyout: pte should exist 0x%x %d\n", dstva, len);
       return -1;
-
-    // Check if this is a COW page that needs to be copied
-    if(*pte & PTE_COW) {
-      if(uvmcowcopy(va0) < 0)
-        return -1;
-      // Reload PTE after potential modification
-      pte = walk(pagetable, va0, 0);
-      if(pte == 0 || (*pte & PTE_V) == 0 || (*pte & PTE_U) == 0)
-        return -1;
     }
 
+
+    // forbid copyout over read-only user text pages.
     if((*pte & PTE_W) == 0)
       return -1;
-
-    pa0 = PTE2PA(*pte);
+    
+    pa0 = walkaddr(pagetable, va0);
+    if(pa0 == 0)
+      return -1;
     n = PGSIZE - (dstva - va0);
     if(n > len)
       n = len;
@@ -409,7 +425,7 @@ int
 copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len)
 {
   uint64 n, va0, pa0;
-
+  
   while(len > 0){
     va0 = PGROUNDDOWN(srcva);
     pa0 = walkaddr(pagetable, va0);
@@ -470,64 +486,19 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
   }
 }
 
-// Check if a page is a COW page
-int
-uvmcheckcowpage(uint64 va)
-{
-  struct proc *p = myproc();
-  pte_t *pte;
 
-  if(va >= MAXVA)
-    return 0;
-
-  pte = walk(p->pagetable, va, 0);
-  if(pte == 0)
-    return 0;
-  if((*pte & PTE_V) == 0)
-    return 0;
-  if((*pte & PTE_U) == 0)
-    return 0;
-
-  return (*pte & PTE_COW) != 0;
+#ifdef LAB_PGTBL
+void
+vmprint(pagetable_t pagetable) {
+  // your code here
 }
+#endif
 
-// Handle COW page fault: allocate new page, copy content, update PTE
-// Returns 0 on success, -1 on failure
-int
-uvmcowcopy(uint64 va)
-{
-  struct proc *p = myproc();
-  pte_t *pte;
-  uint64 pa;
-  uint flags;
-  void *newpage;
 
-  if(va >= MAXVA)
-    return -1;
 
-  pte = walk(p->pagetable, va, 0);
-  if(pte == 0)
-    return -1;
-  if((*pte & PTE_V) == 0)
-    return -1;
-  if((*pte & PTE_U) == 0)
-    return -1;
-  if((*pte & PTE_COW) == 0)
-    return -1;
-
-  pa = PTE2PA(*pte);
-  flags = PTE_FLAGS(*pte);
-
-  // Allocate new page and copy content
-  newpage = kcopy_n_deref((void*)pa);
-  if(newpage == 0)
-    return -1;
-
-  // Remove COW flag and add write permission
-  flags = (flags & ~PTE_COW) | PTE_W;
-
-  // Update PTE
-  *pte = PA2PTE((uint64)newpage) | flags;
-
-  return 0;
+#ifdef LAB_PGTBL
+pte_t*
+pgpte(pagetable_t pagetable, uint64 va) {
+  return walk(pagetable, va, 0);
 }
+#endif

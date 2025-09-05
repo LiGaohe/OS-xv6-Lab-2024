@@ -1,44 +1,52 @@
 #include "kernel/types.h"
+#include "kernel/stat.h"
 #include "user/user.h"
 
-int main() {
-    int parent[2];
-    int child[2];
-    pipe(parent);
-    pipe(child);
+#define N 5
+char buf[N];
 
-    int pid = fork();
-    // 如果创建的子进程进程id小于0，说明创建失败
-    if (pid < 0) {
-        fprintf(2, "fork failed\n");
-        exit(1);
-    }
+void
+pong(int *parent_to_child, int *child_to_parent) {
+  if (read(parent_to_child[0], buf, N) < 0) {
+    printf("read failed\n");
+  }
+  printf("%d: received %s\n", getpid(), buf);
+  if (write(child_to_parent[1], "pong", 4) != 4) {
+    printf("write failed\n");
+  }
+}
 
-    // 等于0，说明是子进程
-    if (pid == 0) {
-        char buf;
-        // 确保管道单向
-        close(parent[1]);
-        close(child[0]);
+void
+ping(int *parent_to_child, int *child_to_parent) {
+  
+  if (write(parent_to_child[1], "ping", 4) != 4) {
+    printf("write failed\n");
+  }
+  if (read(child_to_parent[0], buf, N) < 0) {
+    printf("read failed\n");
+  }
+  printf("%d: received %s\n", getpid(), buf);
+}
 
-        read(parent[0], &buf, 1);
-        printf("%d: received ping\n", getpid());
-        write(child[1], "b", 1);
-        // 使用完毕后关闭管道
-        close(parent[0]);
-        close(child[1]);
-        exit(0);
-    } else {
-        char buf;
-        close(parent[0]);
-        close(child[1]);
-        write(parent[1], "a", 1);
-        read(child[0], &buf, 1);
-        printf("%d: received pong\n", getpid());
-        close(parent[1]);
-        close(child[0]);
-        // 确保父进程在子进程退出后再退出
-        wait(0);
-        exit(0);
-    }
+int
+main(int argc, char *argv[])
+{
+  int parent_to_child[2];
+  int child_to_parent[2];
+
+  int pid;
+
+  if (pipe(parent_to_child) < 0 || pipe(child_to_parent) < 0) {
+    printf("pipe failed\n");
+  }
+  if ((pid = fork()) < 0) {
+    printf("fork failed\n");
+  }
+  if (pid == 0) {
+    pong(parent_to_child, child_to_parent);
+  } else {
+    ping(parent_to_child, child_to_parent);
+  }
+  
+  exit(0);
 }

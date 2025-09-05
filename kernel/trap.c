@@ -68,30 +68,16 @@ usertrap(void)
   } else if((which_dev = devintr()) != 0){
     // ok
   } else {
-    uint64 cause = r_scause();
-    uint64 stval = r_stval();
 
-    // Check for write page fault (store/AMO page fault, cause 15)
-    if(cause == 15) {
-      // Check if this is a COW page
-      if(uvmcheckcowpage(stval)) {
-        if(uvmcowcopy(stval) == 0) {
-          // Successfully handled COW page fault
-          goto handled;
-        }
-        // Fall through to kill process if COW copy failed (out of memory)
-      }
-    }
 
-    printf("usertrap(): unexpected scause 0x%lx pid=%d\n", cause, p->pid);
-    printf("            sepc=0x%lx stval=0x%lx\n", r_sepc(), stval);
+    printf("usertrap(): unexpected scause 0x%lx pid=%d\n", r_scause(), p->pid);
+    printf("            sepc=0x%lx stval=0x%lx\n", r_sepc(), r_stval());
     setkilled(p);
   }
 
-handled:
-
   if(killed(p))
     exit(-1);
+  
 
   // give up the CPU if this is a timer interrupt.
   if(which_dev == 2)
@@ -213,7 +199,13 @@ devintr()
       uartintr();
     } else if(irq == VIRTIO0_IRQ){
       virtio_disk_intr();
-    } else if(irq){
+    }
+#ifdef LAB_NET
+    else if(irq == E1000_IRQ){
+      e1000_intr();
+    }
+#endif
+    else if(irq){
       printf("unexpected interrupt irq=%d\n", irq);
     }
 
