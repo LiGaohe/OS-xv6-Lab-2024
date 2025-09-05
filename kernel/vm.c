@@ -5,6 +5,8 @@
 #include "riscv.h"
 #include "defs.h"
 #include "fs.h"
+#include "spinlock.h"
+#include "proc.h"
 
 /*
  * the kernel's page table.
@@ -93,7 +95,7 @@ walk(pagetable_t pagetable, uint64 va, int alloc)
     if(*pte & PTE_V) {
       pagetable = (pagetable_t)PTE2PA(*pte);
     } else {
-      if(!alloc || (pagetable = (pde_t*)kalloc()) == 0)
+      if(!alloc || (pagetable = (pagetable_t)kalloc()) == 0)
         return 0;
       memset(pagetable, 0, PGSIZE);
       *pte = PA2PTE(pagetable) | PTE_V;
@@ -305,8 +307,8 @@ uvmfree(pagetable_t pagetable, uint64 sz)
 
 // Given a parent process's page table, copy
 // its memory into a child's page table.
-// Copies both the page table and the
-// physical memory.
+// Uses copy-on-write: instead of copying pages,
+// map them read-only and shared, with COW flag.
 // returns 0 on success, -1 on failure.
 // frees any allocated pages on failure.
 int
@@ -321,25 +323,21 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
       panic("uvmcopy: pte should exist");
     if((*pte & PTE_V) == 0)
       panic("uvmcopy: page not present");
+    
     pa = PTE2PA(*pte);
     flags = PTE_FLAGS(*pte);
 
-    // 设置COW标志
-    if(flags & PTE_W){          // 原来是可写的页
-      *pte &= ~PTE_W;           // 清除可写标志
-      *pte |= PTE_COW;          // 设置COW标志
-    } else {                    // 原来是只读的页
-      *pte |= PTE_COW;          // 标记为COW
+    // If the page was writable, make it COW and remove write permission
+    if(flags & PTE_W) {
+      flags = (flags & ~PTE_W) | PTE_COW;
+      *pte = PA2PTE(pa) | flags;
     }
-    
-    // 增加引用计数
-    kaddref((void*)pa);
-    
-    // 直接映射相同的物理页（不复制），并设置相同的标志
-    uint64 new_flags = (flags & ~PTE_W) | PTE_COW; // 清除写权限，添加COW标志
-    if(mappages(new, i, PGSIZE, pa, new_flags) != 0){
+
+    // Map the same physical page in child, increment reference count
+    if(mappages(new, i, PGSIZE, pa, flags) != 0){
       goto err;
     }
+    krefpage((void*)pa);
   }
   return 0;
 
@@ -378,25 +376,20 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
     if(pte == 0 || (*pte & PTE_V) == 0 || (*pte & PTE_U) == 0)
       return -1;
 
-    // 处理 COW 页
-    if ((*pte & PTE_W) == 0 && (*pte & PTE_COW) != 0) {
-      uint64 pa = PTE2PA(*pte);  // 物理地址
-      void *new = kalloc();  // 分配新物理页
-      if (new == 0) {
+    // Check if this is a COW page that needs to be copied
+    if(*pte & PTE_COW) {
+      if(uvmcowcopy(va0) < 0)
         return -1;
-      }
-      memmove(new, (void *)pa, PGSIZE);  // 复制原页面内容到新页
-      uint64 flags = (PTE_FLAGS(*pte) & ~PTE_COW) | PTE_W;  // 新页可写
-      *pte = 0; // 先清空旧PTE，避免mappages remap panic
-      if (mappages(pagetable, PGROUNDDOWN(va0), PGSIZE, (uint64)new, flags) != 0) {  // 映射新页
-        kfree(new);
+      // Reload PTE after potential modification
+      pte = walk(pagetable, va0, 0);
+      if(pte == 0 || (*pte & PTE_V) == 0 || (*pte & PTE_U) == 0)
         return -1;
-      }
-      kfree((void *)pa);  // 释放旧物理页
-      pa0 = (uint64)new;  // 更新物理地址为新页
-    } else {
-      pa0 = PTE2PA(*pte);
     }
+
+    if((*pte & PTE_W) == 0)
+      return -1;
+
+    pa0 = PTE2PA(*pte);
     n = PGSIZE - (dstva - va0);
     if(n > len)
       n = len;
@@ -475,4 +468,66 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
   } else {
     return -1;
   }
+}
+
+// Check if a page is a COW page
+int
+uvmcheckcowpage(uint64 va)
+{
+  struct proc *p = myproc();
+  pte_t *pte;
+
+  if(va >= MAXVA)
+    return 0;
+
+  pte = walk(p->pagetable, va, 0);
+  if(pte == 0)
+    return 0;
+  if((*pte & PTE_V) == 0)
+    return 0;
+  if((*pte & PTE_U) == 0)
+    return 0;
+
+  return (*pte & PTE_COW) != 0;
+}
+
+// Handle COW page fault: allocate new page, copy content, update PTE
+// Returns 0 on success, -1 on failure
+int
+uvmcowcopy(uint64 va)
+{
+  struct proc *p = myproc();
+  pte_t *pte;
+  uint64 pa;
+  uint flags;
+  void *newpage;
+
+  if(va >= MAXVA)
+    return -1;
+
+  pte = walk(p->pagetable, va, 0);
+  if(pte == 0)
+    return -1;
+  if((*pte & PTE_V) == 0)
+    return -1;
+  if((*pte & PTE_U) == 0)
+    return -1;
+  if((*pte & PTE_COW) == 0)
+    return -1;
+
+  pa = PTE2PA(*pte);
+  flags = PTE_FLAGS(*pte);
+
+  // Allocate new page and copy content
+  newpage = kcopy_n_deref((void*)pa);
+  if(newpage == 0)
+    return -1;
+
+  // Remove COW flag and add write permission
+  flags = (flags & ~PTE_COW) | PTE_W;
+
+  // Update PTE
+  *pte = PA2PTE((uint64)newpage) | flags;
+
+  return 0;
 }

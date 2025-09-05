@@ -9,11 +9,6 @@
 #include "riscv.h"
 #include "defs.h"
 
-struct {
-  struct spinlock lock;
-  int   count[PHYSTOP / PGSIZE];
-} ref;  // 物理页引用计数数组
-
 void freerange(void *pa_start, void *pa_end);
 
 extern char end[]; // first address after kernel.
@@ -28,12 +23,17 @@ struct {
   struct run *freelist;
 } kmem;
 
+// Reference counts for physical pages
+struct {
+  struct spinlock lock;
+  int refcnt[PHYSTOP/PGSIZE];  // reference count for each physical page
+} ref;
+
 void
 kinit()
 {
-  initlock(&ref.lock, "ref");
-  memset(ref.count, 0, sizeof(ref.count));  // 初始化引用计数数组
   initlock(&kmem.lock, "kmem");
+  initlock(&ref.lock, "ref");
   freerange(end, (void*)PHYSTOP);
 }
 
@@ -42,8 +42,13 @@ freerange(void *pa_start, void *pa_end)
 {
   char *p;
   p = (char*)PGROUNDUP((uint64)pa_start);
-  for(; p + PGSIZE <= (char*)pa_end; p += PGSIZE)
+  for(; p + PGSIZE <= (char*)pa_end; p += PGSIZE) {
+    // Initialize reference count to 1 before calling kfree
+    acquire(&ref.lock);
+    ref.refcnt[(uint64)p / PGSIZE] = 1;
+    release(&ref.lock);
     kfree(p);
+  }
 }
 
 // Free the page of physical memory pointed at by pa,
@@ -54,29 +59,22 @@ void
 kfree(void *pa)
 {
   struct run *r;
-  uint64 idx = (uint64)pa / PGSIZE;
-  
-  acquire(&ref.lock);
-  
-  // 处理初始化阶段：引用计数为0或负数时，直接置0并释放
-  if (ref.count[idx] <= 0) {
-    ref.count[idx] = 0;
-    release(&ref.lock);
-  } else {
-    // 正常使用阶段：减少引用计数
-    ref.count[idx]--;
-    if (ref.count[idx] > 0) {
-      // 引用计数还不为0，不释放页面
-      release(&ref.lock);
-      return;
-    }
-    // 引用计数为0，需要释放页面
-    release(&ref.lock);
-  }
-  
-  // 只有在真正需要释放页面时才执行后续操作
+
   if(((uint64)pa % PGSIZE) != 0 || (char*)pa < end || (uint64)pa >= PHYSTOP)
     panic("kfree");
+
+  // Decrement reference count
+  acquire(&ref.lock);
+  int idx = (uint64)pa / PGSIZE;
+  if(ref.refcnt[idx] < 1)
+    panic("kfree ref");
+  ref.refcnt[idx] -= 1;
+  int should_free = (ref.refcnt[idx] == 0);
+  release(&ref.lock);
+
+  // Only free if no more references
+  if(!should_free)
+    return;
 
   // Fill with junk to catch dangling refs.
   memset(pa, 1, PGSIZE);
@@ -105,20 +103,53 @@ kalloc(void)
 
   if(r) {
     memset((char*)r, 5, PGSIZE); // fill with junk
-    // 分配成功，设置引用计数为1
+    // Initialize reference count to 1
     acquire(&ref.lock);
-    ref.count[(uint64)r / PGSIZE] = 1;
+    ref.refcnt[(uint64)r / PGSIZE] = 1;
     release(&ref.lock);
   }
   return (void*)r;
 }
 
-// 增加物理页的引用计数
+// Increment reference count for page
 void
-kaddref(void *pa)
+krefpage(void *pa)
 {
-  uint64 idx = (uint64)pa / PGSIZE;
+  if(((uint64)pa % PGSIZE) != 0 || (char*)pa < end || (uint64)pa >= PHYSTOP)
+    return;
+  
   acquire(&ref.lock);
-  ref.count[idx]++;
+  ref.refcnt[(uint64)pa / PGSIZE] += 1;
   release(&ref.lock);
+}
+
+// Copy page and decrement reference count
+// Returns new page or 0 if out of memory
+void*
+kcopy_n_deref(void *pa)
+{
+  if(((uint64)pa % PGSIZE) != 0 || (char*)pa < end || (uint64)pa >= PHYSTOP)
+    return 0;
+
+  acquire(&ref.lock);
+  int idx = (uint64)pa / PGSIZE;
+  int refcount = ref.refcnt[idx];
+  release(&ref.lock);
+
+  // If only one reference, just return the same page
+  if(refcount == 1)
+    return pa;
+
+  // Allocate new page
+  void *newpa = kalloc();
+  if(newpa == 0)
+    return 0;
+
+  // Copy contents
+  memmove(newpa, pa, PGSIZE);
+
+  // Decrement reference count of old page
+  kfree(pa);
+
+  return newpa;
 }
