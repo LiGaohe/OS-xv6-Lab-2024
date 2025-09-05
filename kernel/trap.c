@@ -68,6 +68,42 @@ usertrap(void)
   } else if((which_dev = devintr()) != 0){
     // ok
   } else {
+    // 用户进程写入共享只读页
+    // COW缺页异常
+    if (r_scause() == 15 || r_scause() == 13) {
+      uint64 va = r_stval();  // 发生异常的虚拟地址
+      if (va >= MAXVA) {  // 超过最大虚拟地址
+        p -> killed = 1;
+        goto end;
+      }
+      pte_t *pte = walk(p -> pagetable, va, 0);  // 找到该虚拟地址对应的页表项
+      if (pte == 0 || (*pte & PTE_V) == 0 || (*pte & PTE_U) == 0) {
+        // 页表项不存在或无效，或用户不可读
+        p -> killed = 1;
+        goto end;
+      }
+      if ((*pte & PTE_COW) == 0) {
+        // 该页表项不是COW页
+        p -> killed = 1;
+        goto end;
+      }
+      uint64 pa = PTE2PA(*pte);  // 物理地址
+      void *new = kalloc();  // 分配新物理页
+      if (new == 0) {
+        p -> killed = 1;
+        goto end;
+      }
+      memmove(new, (void *)pa, PGSIZE);  // 复制内容
+      uint64 flags = (PTE_FLAGS(*pte) & ~PTE_COW) | PTE_W;  // 新页可写
+      *pte = 0; // 先清空旧PTE，避免mappages remap panic
+      if (mappages(p -> pagetable, PGROUNDDOWN(va),PGSIZE, (uint64)new, flags) != 0) {  // 映射新页
+        kfree(new);
+        p -> killed = 1;
+        goto end;
+      }
+      kfree((void *)pa);  // 释放旧物理页
+      goto end;
+    }
     printf("usertrap(): unexpected scause 0x%lx pid=%d\n", r_scause(), p->pid);
     printf("            sepc=0x%lx stval=0x%lx\n", r_sepc(), r_stval());
     setkilled(p);
@@ -76,22 +112,23 @@ usertrap(void)
   if(killed(p))
     exit(-1);
 
-// 若设备号为2，则为时间中断，alarm
-if(which_dev == 2 && p->alarm_interval > 0){  
-	      if(--p->alarm_ticks_left == 0 && !p->alarm_running){  
-	        // 备份用户寄存器  
-	        memmove(p->alarm_trapframe, p->trapframe, sizeof(struct trapframe));  
-	        p->alarm_running = 1;  // 标记正在运行handler，防重入
-	        // 修改返回地址为用户 handler
-	        p->trapframe->epc = (uint64)p->alarm_handler;  
-	        // 重置计数器 
-	        p->alarm_ticks_left = p->alarm_interval;  
-	      }  
-	    }
+  // 若设备号为2，则为时间中断，alarm
+  if(which_dev == 2 && p->alarm_interval > 0) {  
+    if(--p->alarm_ticks_left == 0 && !p->alarm_running) {  
+      // 备份用户寄存器  
+      memmove(p->alarm_trapframe, p->trapframe, sizeof(struct trapframe));  
+      p->alarm_running = 1;  // 标记正在运行handler，防重入
+      // 修改返回地址为用户 handler
+      p->trapframe->epc = (uint64)p->alarm_handler;  
+      // 重置计数器 
+      p->alarm_ticks_left = p->alarm_interval;  
+    }  
+  }
   // give up the CPU if this is a timer interrupt.
   if(which_dev == 2)
     yield();
 
+end:  
   usertrapret();
 }
 

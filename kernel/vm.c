@@ -315,7 +315,6 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
   pte_t *pte;
   uint64 pa, i;
   uint flags;
-  char *mem;
 
   for(i = 0; i < sz; i += PGSIZE){
     if((pte = walk(old, i, 0)) == 0)
@@ -324,11 +323,21 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
       panic("uvmcopy: page not present");
     pa = PTE2PA(*pte);
     flags = PTE_FLAGS(*pte);
-    if((mem = kalloc()) == 0)
-      goto err;
-    memmove(mem, (char*)pa, PGSIZE);
-    if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
-      kfree(mem);
+
+    // 设置COW标志
+    if(flags & PTE_W){          // 原来是可写的页
+      *pte &= ~PTE_W;           // 清除可写标志
+      *pte |= PTE_COW;          // 设置COW标志
+    } else {                    // 原来是只读的页
+      *pte |= PTE_COW;          // 标记为COW
+    }
+    
+    // 增加引用计数
+    kaddref((void*)pa);
+    
+    // 直接映射相同的物理页（不复制），并设置相同的标志
+    uint64 new_flags = (flags & ~PTE_W) | PTE_COW; // 清除写权限，添加COW标志
+    if(mappages(new, i, PGSIZE, pa, new_flags) != 0){
       goto err;
     }
   }
@@ -366,10 +375,28 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
     if(va0 >= MAXVA)
       return -1;
     pte = walk(pagetable, va0, 0);
-    if(pte == 0 || (*pte & PTE_V) == 0 || (*pte & PTE_U) == 0 ||
-       (*pte & PTE_W) == 0)
+    if(pte == 0 || (*pte & PTE_V) == 0 || (*pte & PTE_U) == 0)
       return -1;
-    pa0 = PTE2PA(*pte);
+
+    // 处理 COW 页
+    if ((*pte & PTE_W) == 0 && (*pte & PTE_COW) != 0) {
+      uint64 pa = PTE2PA(*pte);  // 物理地址
+      void *new = kalloc();  // 分配新物理页
+      if (new == 0) {
+        return -1;
+      }
+      memmove(new, (void *)pa, PGSIZE);  // 复制原页面内容到新页
+      uint64 flags = (PTE_FLAGS(*pte) & ~PTE_COW) | PTE_W;  // 新页可写
+      *pte = 0; // 先清空旧PTE，避免mappages remap panic
+      if (mappages(pagetable, PGROUNDDOWN(va0), PGSIZE, (uint64)new, flags) != 0) {  // 映射新页
+        kfree(new);
+        return -1;
+      }
+      kfree((void *)pa);  // 释放旧物理页
+      pa0 = (uint64)new;  // 更新物理地址为新页
+    } else {
+      pa0 = PTE2PA(*pte);
+    }
     n = PGSIZE - (dstva - va0);
     if(n > len)
       n = len;
