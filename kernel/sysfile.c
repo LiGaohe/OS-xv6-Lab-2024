@@ -328,39 +328,6 @@ sys_open(void)
       return -1;
     }
     ilock(ip);
-    
-    // Handle symbolic links unless O_NOFOLLOW is set
-    if(ip->type == T_SYMLINK && !(omode & O_NOFOLLOW)){
-      char target[MAXPATH];
-      int depth = 0;
-      
-      while(ip->type == T_SYMLINK && depth < 10){
-        int len = readi(ip, 0, (uint64)target, 0, MAXPATH-1);
-        if(len <= 0){
-          iunlockput(ip);
-          end_op();
-          return -1;
-        }
-        target[len] = 0; // null terminate
-        
-        iunlockput(ip);
-        
-        if((ip = namei(target)) == 0){
-          end_op();
-          return -1;
-        }
-        ilock(ip);
-        depth++;
-      }
-      
-      if(depth >= 10){
-        // Too many symbolic links
-        iunlockput(ip);
-        end_op();
-        return -1;
-      }
-    }
-    
     if(ip->type == T_DIR && omode != O_RDONLY){
       iunlockput(ip);
       end_op();
@@ -537,33 +504,215 @@ sys_pipe(void)
   return 0;
 }
 
+#ifdef LAB_MMAP
 uint64
-sys_symlink(void)
+sys_mmap(void)
 {
-  char target[MAXPATH], path[MAXPATH];
-  struct inode *ip;
-  int len;
+  uint64 addr;
+  int length, prot, flags, fd;
+  uint64 offset;
+  struct file *f;
+  struct proc *p = myproc();
 
-  if(argstr(0, target, MAXPATH) < 0 || argstr(1, path, MAXPATH) < 0)
+  argaddr(0, &addr);
+  argint(1, &length);
+  argint(2, &prot);
+  argint(3, &flags);
+  argint(4, &fd);
+  argaddr(5, &offset);
+
+  // Check arguments
+  if(length <= 0 || (prot & ~(PROT_READ | PROT_WRITE)) != 0)
+    return -1;
+  
+  if(fd < 0 || fd >= NOFILE || (f = p->ofile[fd]) == 0)
     return -1;
 
-  begin_op();
-
-  // Create a symbolic link inode
-  if((ip = create(path, T_SYMLINK, 0, 0)) == 0){
-    end_op();
-    return -1;
+  // Check permission consistency
+  if(flags == MAP_SHARED) {
+    if((prot & PROT_WRITE) && !f->writable)
+      return -1;
+    if((prot & PROT_READ) && !f->readable)
+      return -1;
   }
 
-  // Write the target path to the symlink's data blocks
-  len = strlen(target);
-  if(writei(ip, 0, (uint64)target, 0, len) != len){
-    iunlockput(ip);
-    end_op();
+  // Find an unused VMA slot
+  int vma_idx = -1;
+  for(int i = 0; i < NVMA; i++) {
+    if(!p->vmas[i].used) {
+      vma_idx = i;
+      break;
+    }
+  }
+  if(vma_idx == -1)
     return -1;
+
+  // Find unused address space
+  uint64 map_addr;
+  if(addr == 0) {
+    // Kernel chooses address - start from end of heap and work up
+    map_addr = PGROUNDUP(p->sz);
+    
+    // Check if this conflicts with any existing VMAs
+    int conflict;
+    do {
+      conflict = 0;
+      for(int i = 0; i < NVMA; i++) {
+        if(p->vmas[i].used) {
+          uint64 vma_start = p->vmas[i].addr;
+          uint64 vma_end = p->vmas[i].addr + p->vmas[i].length;
+          uint64 map_end = map_addr + length;
+          
+          // Check if ranges overlap
+          if(!(map_end <= vma_start || map_addr >= vma_end)) {
+            conflict = 1;
+            map_addr = vma_end; // Move past this VMA
+            break;
+          }
+        }
+      }
+    } while(conflict);
+    
+    // Make sure we don't go too high in virtual memory
+    if(map_addr + length >= MAXVA)
+      return -1;
+  } else {
+    map_addr = addr;
   }
 
-  iunlockput(ip);
-  end_op();
-  return 0;
+  // Set up VMA
+  p->vmas[vma_idx].used = 1;
+  p->vmas[vma_idx].addr = map_addr;
+  p->vmas[vma_idx].length = length;
+  p->vmas[vma_idx].prot = prot;
+  p->vmas[vma_idx].flags = flags;
+  p->vmas[vma_idx].file = f;
+  p->vmas[vma_idx].offset = offset;
+
+  // Increase file reference count
+  filedup(f);
+
+  return map_addr;
 }
+
+uint64
+sys_munmap(void)
+{
+  uint64 addr;
+  int length;
+  
+  argaddr(0, &addr);
+  argint(1, &length);
+
+  struct proc *p = myproc();
+
+  // Find the VMA containing this address range
+  for(int i = 0; i < NVMA; i++) {
+    struct vma *v = &p->vmas[i];
+    if(v->used && addr >= v->addr && addr + length <= v->addr + v->length) {
+      // Handle partial unmapping
+      if(addr == v->addr && length == v->length) {
+        // Unmapping entire VMA
+        
+        // Write back MAP_SHARED pages that might be dirty
+        if(v->flags == MAP_SHARED && (v->prot & PROT_WRITE)) {
+          for(uint64 va = v->addr; va < v->addr + v->length; va += PGSIZE) {
+            uint64 pa = walkaddr(p->pagetable, va);
+            if(pa != 0) {
+              // Write the page back to file
+              uint64 offset_in_vma = va - v->addr;
+              uint64 file_offset = v->offset + offset_in_vma;
+              
+              begin_op();
+              ilock(v->file->ip);
+              int bytes_to_write = PGSIZE;
+              // Don't write beyond the file
+              if(file_offset + PGSIZE > v->file->ip->size) {
+                if(file_offset < v->file->ip->size) {
+                  bytes_to_write = v->file->ip->size - file_offset;
+                } else {
+                  bytes_to_write = 0;
+                }
+              }
+              if(bytes_to_write > 0) {
+                writei(v->file->ip, 0, pa, file_offset, bytes_to_write);
+              }
+              iunlock(v->file->ip);
+              end_op();
+            }
+          }
+        }
+        
+        // Unmap all pages in this VMA
+        uvmunmap_safe(p->pagetable, v->addr, v->length / PGSIZE, 1);
+        
+        // Close file
+        fileclose(v->file);
+        
+        // Mark VMA as unused
+        v->used = 0;
+        return 0;
+      } else {
+        // Partial unmapping
+        
+        // Write back MAP_SHARED pages that might be dirty
+        if(v->flags == MAP_SHARED && (v->prot & PROT_WRITE)) {
+          for(uint64 va = addr; va < addr + length; va += PGSIZE) {
+            uint64 pa = walkaddr(p->pagetable, va);
+            if(pa != 0) {
+              // Write the page back to file
+              uint64 offset_in_vma = va - v->addr;
+              uint64 file_offset = v->offset + offset_in_vma;
+              
+              begin_op();
+              ilock(v->file->ip);
+              int bytes_to_write = PGSIZE;
+              // Don't write beyond the file
+              if(file_offset + PGSIZE > v->file->ip->size) {
+                if(file_offset < v->file->ip->size) {
+                  bytes_to_write = v->file->ip->size - file_offset;
+                } else {
+                  bytes_to_write = 0;
+                }
+              }
+              if(bytes_to_write > 0) {
+                writei(v->file->ip, 0, pa, file_offset, bytes_to_write);
+              }
+              iunlock(v->file->ip);
+              end_op();
+            }
+          }
+        }
+        
+        // Unmap the specified pages
+        uvmunmap_safe(p->pagetable, addr, length / PGSIZE, 1);
+        
+        // Update VMA to reflect partial unmapping
+        if(addr == v->addr) {
+          // Unmapping from the beginning
+          v->addr += length;
+          v->offset += length;
+          v->length -= length;
+        } else if(addr + length == v->addr + v->length) {
+          // Unmapping from the end
+          v->length -= length;
+        } else {
+          // Unmapping from the middle - would need to split VMA
+          // For now, we don't support this case
+          return -1;
+        }
+        
+        // If VMA becomes empty, mark as unused
+        if(v->length == 0) {
+          fileclose(v->file);
+          v->used = 0;
+        }
+        
+        return 0;
+      }
+    }
+  }
+  
+  return -1;
+}
+#endif

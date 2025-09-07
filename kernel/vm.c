@@ -5,6 +5,11 @@
 #include "riscv.h"
 #include "defs.h"
 #include "fs.h"
+#include "spinlock.h"
+#include "sleeplock.h"
+#include "proc.h"
+#include "file.h"
+#include "fcntl.h"
 
 /*
  * the kernel's page table.
@@ -449,3 +454,98 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
     return -1;
   }
 }
+
+#ifdef LAB_MMAP
+// Safe version of uvmunmap that doesn't panic on unmapped pages
+void
+uvmunmap_safe(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
+{
+  uint64 a;
+  pte_t *pte;
+
+  if((va % PGSIZE) != 0)
+    panic("uvmunmap_safe: not aligned");
+
+  for(a = va; a < va + npages*PGSIZE; a += PGSIZE){
+    if((pte = walk(pagetable, a, 0)) == 0)
+      continue; // Skip unmapped pages
+    if((*pte & PTE_V) == 0)
+      continue; // Skip invalid pages
+    if(PTE_FLAGS(*pte) == PTE_V)
+      panic("uvmunmap_safe: not a leaf");
+    if(do_free){
+      uint64 pa = PTE2PA(*pte);
+      kfree((void*)pa);
+    }
+    *pte = 0;
+  }
+}
+
+// Handle page fault for mmap-ed region
+int
+mmap_handler(uint64 fault_va, uint64 scause)
+{
+  struct proc *p = myproc();
+  struct vma *v = 0;
+
+  // Find the VMA that contains the faulting address
+  for(int i = 0; i < NVMA; i++) {
+    if(p->vmas[i].used && 
+       fault_va >= p->vmas[i].addr && 
+       fault_va < p->vmas[i].addr + p->vmas[i].length) {
+      v = &p->vmas[i];
+      break;
+    }
+  }
+
+  if(v == 0)
+    return -1; // No VMA found
+
+  // Check if it's a write fault to a read-only mapping
+  if(scause == 15) { // Store/write fault
+    if(!(v->prot & PROT_WRITE)) {
+      return -1; // Writing to read-only mapping, should kill process
+    }
+  }
+
+  // Calculate page address
+  uint64 page_start = PGROUNDDOWN(fault_va);
+  
+  // Check if page is already mapped
+  if(walkaddr(p->pagetable, page_start) != 0)
+    return -1; // Page already mapped, shouldn't happen
+
+  // Allocate a page
+  char *mem = kalloc();
+  if(mem == 0)
+    return -1;
+
+  memset(mem, 0, PGSIZE);
+
+  // Calculate file offset for this page
+  uint64 offset_in_vma = page_start - v->addr;
+  uint64 file_offset = v->offset + offset_in_vma;
+
+  // Read file into the page
+  ilock(v->file->ip);
+  int bytes_read = readi(v->file->ip, 0, (uint64)mem, file_offset, PGSIZE);
+  iunlock(v->file->ip);
+
+  if(bytes_read < 0) {
+    kfree(mem);
+    return -1;
+  }
+
+  // Map the page with appropriate permissions
+  int pte_flags = PTE_U;
+  if(v->prot & PROT_READ) pte_flags |= PTE_R;
+  if(v->prot & PROT_WRITE) pte_flags |= PTE_W;
+
+  if(mappages(p->pagetable, page_start, PGSIZE, (uint64)mem, pte_flags) != 0) {
+    kfree(mem);
+    return -1;
+  }
+
+  return 0;
+}
+#endif

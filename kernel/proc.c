@@ -5,6 +5,12 @@
 #include "spinlock.h"
 #include "proc.h"
 #include "defs.h"
+#ifdef LAB_MMAP
+#include "sleeplock.h"
+#include "fs.h"
+#include "fcntl.h"
+#include "file.h"
+#endif
 
 struct cpu cpus[NCPU];
 
@@ -98,6 +104,7 @@ allocpid()
   pid = nextpid;
   nextpid = nextpid + 1;
   release(&pid_lock);
+
   return pid;
 }
 
@@ -131,7 +138,6 @@ found:
     return 0;
   }
 
-
   // An empty user page table.
   p->pagetable = proc_pagetable(p);
   if(p->pagetable == 0){
@@ -145,6 +151,13 @@ found:
   memset(&p->context, 0, sizeof(p->context));
   p->context.ra = (uint64)forkret;
   p->context.sp = p->kstack + PGSIZE;
+
+#ifdef LAB_MMAP
+  // Initialize VMAs
+  for(int i = 0; i < NVMA; i++) {
+    p->vmas[i].used = 0;
+  }
+#endif
 
   return p;
 }
@@ -201,7 +214,6 @@ proc_pagetable(struct proc *p)
     uvmfree(pagetable, 0);
     return 0;
   }
-
 
   return pagetable;
 }
@@ -264,7 +276,6 @@ growproc(int n)
   struct proc *p = myproc();
 
   sz = p->sz;
-  
   if(n > 0){
     if((sz = uvmalloc(p->pagetable, sz, sz + n, PTE_W)) == 0) {
       return -1;
@@ -289,7 +300,7 @@ fork(void)
   if((np = allocproc()) == 0){
     return -1;
   }
-  
+
   // Copy user memory from parent to child.
   if(uvmcopy(p->pagetable, np->pagetable, p->sz) < 0){
     freeproc(np);
@@ -297,7 +308,6 @@ fork(void)
     return -1;
   }
   np->sz = p->sz;
-
 
   // copy saved user registers.
   *(np->trapframe) = *(p->trapframe);
@@ -313,17 +323,26 @@ fork(void)
 
   safestrcpy(np->name, p->name, sizeof(p->name));
 
+#ifdef LAB_MMAP
+  // Copy VMAs
+  for(i = 0; i < NVMA; i++) {
+    if(p->vmas[i].used) {
+      np->vmas[i] = p->vmas[i];
+      filedup(np->vmas[i].file); // increment file reference count
+    }
+  }
+#endif
+
   pid = np->pid;
 
   release(&np->lock);
-  
+
   acquire(&wait_lock);
   np->parent = p;
   release(&wait_lock);
 
   acquire(&np->lock);
   np->state = RUNNABLE;
-
   release(&np->lock);
 
   return pid;
@@ -364,11 +383,53 @@ exit(int status)
     }
   }
 
-  
   begin_op();
   iput(p->cwd);
   end_op();
   p->cwd = 0;
+
+#ifdef LAB_MMAP
+  // Clean up mmap-ed regions
+  for(int i = 0; i < NVMA; i++) {
+    if(p->vmas[i].used) {
+      // Write back MAP_SHARED pages
+      if(p->vmas[i].flags == MAP_SHARED && (p->vmas[i].prot & PROT_WRITE)) {
+        for(uint64 va = p->vmas[i].addr; va < p->vmas[i].addr + p->vmas[i].length; va += PGSIZE) {
+          uint64 pa = walkaddr(p->pagetable, va);
+          if(pa != 0) {
+            uint64 offset_in_vma = va - p->vmas[i].addr;
+            uint64 file_offset = p->vmas[i].offset + offset_in_vma;
+            
+            begin_op();
+            ilock(p->vmas[i].file->ip);
+            int bytes_to_write = PGSIZE;
+            if(file_offset + PGSIZE > p->vmas[i].file->ip->size) {
+              if(file_offset < p->vmas[i].file->ip->size) {
+                bytes_to_write = p->vmas[i].file->ip->size - file_offset;
+              } else {
+                bytes_to_write = 0;
+              }
+            }
+            if(bytes_to_write > 0) {
+              writei(p->vmas[i].file->ip, 0, pa, file_offset, bytes_to_write);
+            }
+            iunlock(p->vmas[i].file->ip);
+            end_op();
+          }
+        }
+      }
+      
+      // Unmap pages
+      uvmunmap_safe(p->pagetable, p->vmas[i].addr, p->vmas[i].length / PGSIZE, 1);
+      
+      // Close file
+      fileclose(p->vmas[i].file);
+      
+      // Mark VMA as unused
+      p->vmas[i].used = 0;
+    }
+  }
+#endif
 
   acquire(&wait_lock);
 
@@ -459,33 +520,28 @@ scheduler(void)
     // processes are waiting.
     intr_on();
 
-    int nproc = 0;
+    int found = 0;
     for(p = proc; p < &proc[NPROC]; p++) {
       acquire(&p->lock);
-      if(p->state != UNUSED) {
-        nproc++;
-      }
       if(p->state == RUNNABLE) {
         // Switch to chosen process.  It is the process's job
         // to release its lock and then reacquire it
         // before jumping back to us.
         p->state = RUNNING;
         c->proc = p;
-        
         swtch(&c->context, &p->context);
 
         // Process is done running for now.
         // It should have changed its p->state before coming back.
         c->proc = 0;
+        found = 1;
       }
       release(&p->lock);
     }
-    if(nproc <= 2) {   // only init and sh exist
+    if(found == 0) {
       // nothing to run; stop running on this core until an interrupt.
       intr_on();
-#ifndef LAB_FS
       asm volatile("wfi");
-#endif
     }
   }
 }
@@ -534,7 +590,7 @@ void
 forkret(void)
 {
   static int first = 1;
-  
+
   // Still holding p->lock from scheduler.
   release(&myproc()->lock);
 
@@ -703,6 +759,3 @@ procdump(void)
     printf("\n");
   }
 }
-
-
-
